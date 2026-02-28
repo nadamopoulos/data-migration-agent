@@ -1,0 +1,660 @@
+"use client";
+
+import { ChangeEvent, DragEvent, useRef, useState } from "react";
+import { AlertCircle, FileText, Loader2, Upload, X } from "lucide-react";
+import Papa, { ParseResult } from "papaparse";
+import { z } from "zod";
+
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow
+} from "@/components/ui/table";
+import { cn } from "@/lib/utils";
+import type { AgentResponse, Mapping } from "@/lib/schemas";
+import { ResponseSchema } from "@/lib/schemas";
+
+type CsvSummary = {
+  file: File;
+  rowCount: number;
+};
+
+type ParsedCsv = {
+  headers: string[];
+  rows: Record<string, string>[];
+};
+
+type Slot = "input" | "target";
+type Stage = "upload" | "review" | "result";
+type OutputSummary = { rowCount: number; columnCount: number };
+
+const CSV_MIME_TYPES = new Set(["text/csv", "application/vnd.ms-excel"]);
+const MAX_AGENT_ATTEMPTS = 2;
+const PREVIEW_ROWS = 10;
+
+const ApplyResponseSchema = z.object({
+  csv: z.string(),
+  summary: z.object({
+    rowCount: z.number(),
+    columnCount: z.number()
+  })
+});
+
+const isCsvFile = (file: File) =>
+  file.name.toLowerCase().endsWith(".csv") || CSV_MIME_TYPES.has(file.type);
+
+const parseCsv = (file: File) =>
+  new Promise<ParsedCsv>((resolve, reject) => {
+    Papa.parse<Record<string, string>>(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (results) => {
+        if (results.errors.length > 0) {
+          reject(new Error(results.errors[0]?.message || "Unable to parse CSV"));
+          return;
+        }
+
+        const headers = (results.meta.fields ?? []).map((header) => header.trim());
+        const rows = normaliseRows(results, headers);
+        if (headers.length === 0 || rows.length === 0) {
+          reject(new Error("CSV files must include headers and at least one data row."));
+          return;
+        }
+
+        resolve({ headers, rows });
+      },
+      error: (error) => reject(error)
+    });
+  });
+
+const normaliseRows = (
+  results: ParseResult<Record<string, string>>,
+  headers: string[]
+) =>
+  results.data.map((row) =>
+    Object.fromEntries(headers.map((header) => [header, String(row[header] ?? "").trim()]))
+  );
+
+const getSafeErrorMessage = (error: unknown, fallback: string) =>
+  error instanceof Error && error.message ? error.message : fallback;
+
+const createPreviewRows = (csvText: string) => {
+  const parsed = Papa.parse<Record<string, string>>(csvText, {
+    header: true,
+    skipEmptyLines: true
+  });
+  const headers = (parsed.meta.fields ?? []).map((header) => header.trim());
+  const rows = normaliseRows(parsed, headers);
+  return rows.slice(0, PREVIEW_ROWS);
+};
+
+export default function Home() {
+  const inputFileRef = useRef<HTMLInputElement>(null);
+  const targetFileRef = useRef<HTMLInputElement>(null);
+
+  const [inputFile, setInputFile] = useState<File | null>(null);
+  const [targetFile, setTargetFile] = useState<File | null>(null);
+  const [inputParsed, setInputParsed] = useState<ParsedCsv | null>(null);
+  const [targetParsed, setTargetParsed] = useState<ParsedCsv | null>(null);
+  const [mappingPlan, setMappingPlan] = useState<AgentResponse | null>(null);
+  const [editableMappings, setEditableMappings] = useState<Mapping[]>([]);
+  const [outputCsv, setOutputCsv] = useState("");
+  const [outputSummary, setOutputSummary] = useState<OutputSummary | null>(null);
+  const [outputPreview, setOutputPreview] = useState<Record<string, string>[]>([]);
+  const [stage, setStage] = useState<Stage>("upload");
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadingAction, setLoadingAction] = useState<"agent" | "apply" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [inputSummary, setInputSummary] = useState<CsvSummary | null>(null);
+  const [targetSummary, setTargetSummary] = useState<CsvSummary | null>(null);
+  const [draggingSlot, setDraggingSlot] = useState<Slot | null>(null);
+  const [inputError, setInputError] = useState("");
+  const [targetError, setTargetError] = useState("");
+
+  const resetWorkflowState = () => {
+    setMappingPlan(null);
+    setEditableMappings([]);
+    setOutputCsv("");
+    setOutputSummary(null);
+    setOutputPreview([]);
+    setStage("upload");
+  };
+
+  const startOver = () => {
+    setInputFile(null);
+    setTargetFile(null);
+    setInputParsed(null);
+    setTargetParsed(null);
+    setInputSummary(null);
+    setTargetSummary(null);
+    setInputError("");
+    setTargetError("");
+    setError(null);
+    resetWorkflowState();
+    if (inputFileRef.current) {
+      inputFileRef.current.value = "";
+    }
+    if (targetFileRef.current) {
+      targetFileRef.current.value = "";
+    }
+  };
+
+  const handleChosenFile = async (file: File | null, slot: Slot) => {
+    if (!file) {
+      return;
+    }
+
+    if (!isCsvFile(file)) {
+      const errorMessage = "Only CSV files are supported.";
+      if (slot === "input") {
+        setInputError(errorMessage);
+      } else {
+        setTargetError(errorMessage);
+      }
+      return;
+    }
+
+    try {
+      const parsed = await parseCsv(file);
+      const rowCount = parsed.rows.length;
+      resetWorkflowState();
+      setError(null);
+
+      if (slot === "input") {
+        setInputFile(file);
+        setInputParsed(parsed);
+        setInputSummary({ file, rowCount });
+        setInputError("");
+      } else {
+        setTargetFile(file);
+        setTargetParsed(parsed);
+        setTargetSummary({ file, rowCount });
+        setTargetError("");
+      }
+    } catch (uploadError) {
+      const errorMessage = getSafeErrorMessage(
+        uploadError,
+        "Could not read this CSV file. Please try another one."
+      );
+      if (slot === "input") {
+        setInputFile(null);
+        setInputParsed(null);
+        setInputError(errorMessage);
+      } else {
+        setTargetFile(null);
+        setTargetParsed(null);
+        setTargetError(errorMessage);
+      }
+    }
+  };
+
+  const onFileInputChange =
+    (slot: Slot) =>
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0] ?? null;
+      await handleChosenFile(file, slot);
+    };
+
+  const onDropFile =
+    (slot: Slot) =>
+    async (event: DragEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      setDraggingSlot(null);
+      const file = event.dataTransfer.files?.[0] ?? null;
+      await handleChosenFile(file, slot);
+    };
+
+  const openFileDialog = (slot: Slot) => {
+    if (slot === "input") {
+      inputFileRef.current?.click();
+      return;
+    }
+    targetFileRef.current?.click();
+  };
+
+  const runAgentAttempt = async () => {
+    if (!inputFile || !targetFile) {
+      throw new Error("Please upload both CSV files before running the agent.");
+    }
+
+    const payload = new FormData();
+    payload.append("inputCsv", inputFile);
+    payload.append("targetCsv", targetFile);
+
+    const response = await fetch("/api/process", {
+      method: "POST",
+      body: payload
+    });
+
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(
+        typeof body.error === "string"
+          ? body.error
+          : "The mapping agent request failed."
+      );
+    }
+
+    const validated = ResponseSchema.safeParse(body);
+    if (!validated.success) {
+      throw new Error("The mapping plan response was invalid.");
+    }
+
+    return validated.data;
+  };
+
+  const handleRunAgent = async () => {
+    if (!inputParsed || !targetParsed || !inputFile || !targetFile) {
+      setError("Upload both CSV files before running the agent.");
+      return;
+    }
+
+    if (inputParsed.rows.length === 0 || targetParsed.rows.length === 0) {
+      setError("CSV files cannot be empty.");
+      return;
+    }
+
+    setError(null);
+    setIsLoading(true);
+    setLoadingAction("agent");
+
+    let result: AgentResponse | null = null;
+    let lastError = "The mapping agent could not complete your request.";
+
+    for (let attempt = 1; attempt <= MAX_AGENT_ATTEMPTS; attempt += 1) {
+      try {
+        result = await runAgentAttempt();
+        break;
+      } catch (runError) {
+        lastError = getSafeErrorMessage(
+          runError,
+          "The mapping agent could not complete your request."
+        );
+        const shouldRetry =
+          /response was invalid|invalid mapping plan/i.test(lastError);
+        if (!shouldRetry || attempt === MAX_AGENT_ATTEMPTS) {
+          break;
+        }
+      }
+    }
+
+    setIsLoading(false);
+    setLoadingAction(null);
+
+    if (!result) {
+      setError(lastError);
+      return;
+    }
+
+    setMappingPlan(result);
+    setEditableMappings(result.mappings);
+    setStage("review");
+  };
+
+  const updateMappingRule = (index: number, nextRule: string) => {
+    setEditableMappings((current) =>
+      current.map((mapping, mappingIndex) =>
+        mappingIndex === index
+          ? { ...mapping, normalisationRule: nextRule }
+          : mapping
+      )
+    );
+  };
+
+  const handleApproveAndApply = async () => {
+    if (!inputParsed || editableMappings.length === 0) {
+      setError("No mapping plan is available to apply.");
+      return;
+    }
+
+    setError(null);
+    setIsLoading(true);
+    setLoadingAction("apply");
+
+    try {
+      const response = await fetch("/api/apply", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          mappings: editableMappings,
+          inputCsvData: inputParsed.rows
+        })
+      });
+
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(
+          typeof body.error === "string"
+            ? body.error
+            : "Failed to apply the mapping plan."
+        );
+      }
+
+      const validated = ApplyResponseSchema.safeParse(body);
+      if (!validated.success) {
+        throw new Error("Invalid response received while applying the mapping plan.");
+      }
+
+      const previewRows = createPreviewRows(validated.data.csv);
+      setOutputCsv(validated.data.csv);
+      setOutputSummary(validated.data.summary);
+      setOutputPreview(previewRows);
+      setStage("result");
+    } catch (applyError) {
+      setError(
+        getSafeErrorMessage(
+          applyError,
+          "Unable to apply mappings to the uploaded CSV data."
+        )
+      );
+    } finally {
+      setIsLoading(false);
+      setLoadingAction(null);
+    }
+  };
+
+  const handleDownloadCsv = () => {
+    if (!outputCsv) {
+      return;
+    }
+
+    const blob = new Blob([outputCsv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "normalised-output.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <main className="min-h-screen bg-slate-50 px-4 py-10 md:px-8">
+      <div className="mx-auto w-full max-w-6xl space-y-8">
+        <header className="space-y-3">
+          <h1 className="text-3xl font-semibold tracking-tight text-slate-900 md:text-4xl">
+            CSV Normalisation Agent
+          </h1>
+          <p className="max-w-3xl text-sm text-slate-600 md:text-base">
+            Upload your input data and a target format example to automatically
+            map and normalise your CSV.
+          </p>
+        </header>
+
+        {error && (
+          <Alert className="animate-in fade-in-50 duration-300" variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertTitle>Something went wrong</AlertTitle>
+            <AlertDescription>{error}</AlertDescription>
+            <Button
+              aria-label="Dismiss error"
+              className="absolute right-2 top-2 h-7 w-7 p-0"
+              onClick={() => setError(null)}
+              size="icon"
+              type="button"
+              variant="ghost"
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </Alert>
+        )}
+
+        <section
+          className={cn(
+            "grid gap-6 transition-all duration-300 md:grid-cols-2",
+            stage !== "upload" && "opacity-90"
+          )}
+        >
+          <Card>
+            <CardHeader>
+              <CardTitle>Input CSV</CardTitle>
+              <CardDescription>Your raw data</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <input
+                accept=".csv,text/csv"
+                className="hidden"
+                onChange={onFileInputChange("input")}
+                ref={inputFileRef}
+                type="file"
+              />
+              <div
+                className={cn(
+                  "flex min-h-40 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 px-4 py-6 text-center transition-colors",
+                  draggingSlot === "input" && "border-primary bg-primary/5"
+                )}
+                onClick={() => openFileDialog("input")}
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  setDraggingSlot("input");
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault();
+                  setDraggingSlot((current) =>
+                    current === "input" ? null : current
+                  );
+                }}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={onDropFile("input")}
+              >
+                <Upload className="mb-3 h-6 w-6 text-slate-500" />
+                <p className="text-sm font-medium text-slate-700">
+                  Drag and drop your CSV, or click to browse
+                </p>
+              </div>
+              {inputSummary && (
+                <div className="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-700">
+                  <div className="flex items-center gap-2 font-medium">
+                    <FileText className="h-4 w-4" />
+                    {inputSummary.file.name}
+                  </div>
+                  <p className="mt-1 text-xs text-slate-600">
+                    {inputSummary.rowCount} rows detected
+                  </p>
+                </div>
+              )}
+              {inputError && (
+                <p className="text-sm font-medium text-destructive">{inputError}</p>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Target CSV</CardTitle>
+              <CardDescription>Example of desired output format</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <input
+                accept=".csv,text/csv"
+                className="hidden"
+                onChange={onFileInputChange("target")}
+                ref={targetFileRef}
+                type="file"
+              />
+              <div
+                className={cn(
+                  "flex min-h-40 cursor-pointer flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 px-4 py-6 text-center transition-colors",
+                  draggingSlot === "target" && "border-primary bg-primary/5"
+                )}
+                onClick={() => openFileDialog("target")}
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  setDraggingSlot("target");
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault();
+                  setDraggingSlot((current) =>
+                    current === "target" ? null : current
+                  );
+                }}
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={onDropFile("target")}
+              >
+                <Upload className="mb-3 h-6 w-6 text-slate-500" />
+                <p className="text-sm font-medium text-slate-700">
+                  Drag and drop your CSV, or click to browse
+                </p>
+              </div>
+              {targetSummary && (
+                <div className="rounded-md bg-slate-100 px-3 py-2 text-sm text-slate-700">
+                  <div className="flex items-center gap-2 font-medium">
+                    <FileText className="h-4 w-4" />
+                    {targetSummary.file.name}
+                  </div>
+                  <p className="mt-1 text-xs text-slate-600">
+                    {targetSummary.rowCount} rows detected
+                  </p>
+                </div>
+              )}
+              {targetError && (
+                <p className="text-sm font-medium text-destructive">{targetError}</p>
+              )}
+            </CardContent>
+          </Card>
+        </section>
+
+        {stage === "upload" && (
+          <Button
+            className="w-full transition-all duration-300"
+            disabled={!inputSummary || !targetSummary || isLoading}
+            onClick={handleRunAgent}
+          >
+            {loadingAction === "agent" ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Agent is thinking...
+              </>
+            ) : (
+              "Run Agent"
+            )}
+          </Button>
+        )}
+
+        {stage === "review" && mappingPlan && (
+          <Card className="animate-in fade-in-50 duration-300">
+            <CardHeader>
+              <CardTitle>Mapping &amp; Normalisation Plan</CardTitle>
+              <CardDescription>Edit rules if needed, then approve and apply.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="rounded-md border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Input Column</TableHead>
+                      <TableHead>Target Column</TableHead>
+                      <TableHead>Normalisation Rule</TableHead>
+                      <TableHead>Type</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {editableMappings.map((mapping, index) => (
+                      <TableRow key={`${mapping.inputColumn}-${mapping.targetColumn}-${index}`}>
+                        <TableCell className="font-medium">{mapping.inputColumn}</TableCell>
+                        <TableCell>{mapping.targetColumn}</TableCell>
+                        <TableCell className="min-w-72">
+                          <Input
+                            onChange={(event) =>
+                              updateMappingRule(index, event.target.value)
+                            }
+                            value={mapping.normalisationRule}
+                          />
+                        </TableCell>
+                        <TableCell>{mapping.transformType}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+
+              <p className="text-sm text-slate-600">{mappingPlan.agentNotes}</p>
+              {!!mappingPlan.unmappedInputColumns.length && (
+                <p className="text-sm text-slate-600">
+                  Unmapped input columns: {mappingPlan.unmappedInputColumns.join(", ")}
+                </p>
+              )}
+              {!!mappingPlan.unmappedTargetColumns.length && (
+                <p className="text-sm text-slate-600">
+                  Unmapped target columns: {mappingPlan.unmappedTargetColumns.join(", ")}
+                </p>
+              )}
+
+              <div className="flex flex-wrap items-center gap-2 pt-2">
+                <Button disabled={isLoading} onClick={handleApproveAndApply}>
+                  {loadingAction === "apply" ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Applying...
+                    </>
+                  ) : (
+                    "Approve & Apply"
+                  )}
+                </Button>
+                <Button onClick={startOver} variant="ghost">
+                  Start Over
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {stage === "result" && outputSummary && (
+          <Card className="animate-in fade-in-50 duration-300">
+            <CardHeader>
+              <CardTitle>Normalised Output</CardTitle>
+              <CardDescription>
+                Preview of the first {PREVIEW_ROWS} rows from your transformed CSV.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <p className="text-sm text-slate-700">
+                {outputSummary.rowCount} rows • {outputSummary.columnCount} columns
+              </p>
+
+              {outputPreview.length > 0 ? (
+                <div className="rounded-md border">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        {Object.keys(outputPreview[0]).map((header) => (
+                          <TableHead key={header}>{header}</TableHead>
+                        ))}
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {outputPreview.map((row, rowIndex) => (
+                        <TableRow key={`preview-row-${rowIndex}`}>
+                          {Object.entries(row).map(([key, value]) => (
+                            <TableCell key={`${rowIndex}-${key}`}>{value}</TableCell>
+                          ))}
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              ) : (
+                <p className="text-sm text-slate-600">No preview rows available.</p>
+              )}
+
+              <div className="flex flex-wrap items-center gap-2">
+                <Button onClick={handleDownloadCsv}>Download Normalised CSV</Button>
+                <Button onClick={startOver} variant="ghost">
+                  Start Over
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+      </div>
+    </main>
+  );
+}
