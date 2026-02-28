@@ -1,9 +1,7 @@
 "use client";
 
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
-import { useSession } from "next-auth/react";
-import { useRouter } from "next/navigation";
-import { AlertCircle, FileText, Loader2, Upload, X } from "lucide-react";
+import { AlertCircle, Eye, EyeOff, FileText, Key, Loader2, Upload, X } from "lucide-react";
 import Papa, { ParseResult } from "papaparse";
 import { z } from "zod";
 
@@ -19,7 +17,6 @@ import {
   TableHeader,
   TableRow
 } from "@/components/ui/table";
-import NavBar from "@/components/nav-bar";
 import { cn } from "@/lib/utils";
 import type { AgentResponse, Mapping } from "@/lib/schemas";
 import { ResponseSchema } from "@/lib/schemas";
@@ -41,6 +38,7 @@ type OutputSummary = { rowCount: number; columnCount: number };
 const CSV_MIME_TYPES = new Set(["text/csv", "application/vnd.ms-excel"]);
 const MAX_AGENT_ATTEMPTS = 2;
 const PREVIEW_ROWS = 10;
+const API_KEY_STORAGE_KEY = "anthropic-api-key";
 
 const ApplyResponseSchema = z.object({
   csv: z.string(),
@@ -99,17 +97,12 @@ const createPreviewRows = (csvText: string) => {
 };
 
 export default function Home() {
-  const { data: session, status } = useSession();
-  const router = useRouter();
-
-  useEffect(() => {
-    if (status === "unauthenticated") {
-      router.replace("/login");
-    }
-  }, [status, router]);
-
   const inputFileRef = useRef<HTMLInputElement>(null);
   const targetFileRef = useRef<HTMLInputElement>(null);
+
+  const [apiKey, setApiKey] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [keyConnected, setKeyConnected] = useState(false);
 
   const [inputFile, setInputFile] = useState<File | null>(null);
   const [targetFile, setTargetFile] = useState<File | null>(null);
@@ -129,6 +122,31 @@ export default function Home() {
   const [draggingSlot, setDraggingSlot] = useState<Slot | null>(null);
   const [inputError, setInputError] = useState("");
   const [targetError, setTargetError] = useState("");
+
+  useEffect(() => {
+    const stored = localStorage.getItem(API_KEY_STORAGE_KEY);
+    if (stored) {
+      setApiKey(stored);
+      setKeyConnected(true);
+    }
+  }, []);
+
+  const handleSaveKey = () => {
+    const trimmed = apiKey.trim();
+    if (!trimmed) {
+      return;
+    }
+    localStorage.setItem(API_KEY_STORAGE_KEY, trimmed);
+    setApiKey(trimmed);
+    setKeyConnected(true);
+  };
+
+  const handleDisconnectKey = () => {
+    localStorage.removeItem(API_KEY_STORAGE_KEY);
+    setApiKey("");
+    setKeyConnected(false);
+    setShowKey(false);
+  };
 
   const resetWorkflowState = () => {
     setMappingPlan(null);
@@ -240,8 +258,15 @@ export default function Home() {
     payload.append("inputCsv", inputFile);
     payload.append("targetCsv", targetFile);
 
+    const headers: Record<string, string> = {};
+    const storedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
+    if (storedKey) {
+      headers["x-api-key"] = storedKey;
+    }
+
     const response = await fetch("/api/process", {
       method: "POST",
+      headers,
       body: payload
     });
 
@@ -270,6 +295,11 @@ export default function Home() {
 
     if (inputParsed.rows.length === 0 || targetParsed.rows.length === 0) {
       setError("CSV files cannot be empty.");
+      return;
+    }
+
+    if (!keyConnected) {
+      setError("Please enter your Anthropic API key first.");
       return;
     }
 
@@ -388,32 +418,86 @@ export default function Home() {
     URL.revokeObjectURL(url);
   };
 
-  if (status === "loading") {
-    return (
-      <main className="flex min-h-screen items-center justify-center bg-slate-50">
-        <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
-      </main>
-    );
-  }
-
-  if (!session) {
-    return null;
-  }
-
   return (
-    <>
-      <NavBar />
-      <main className="min-h-screen bg-slate-50 px-4 py-10 md:px-8">
-        <div className="mx-auto w-full max-w-6xl space-y-8">
-          <header className="space-y-3">
-            <h1 className="text-3xl font-semibold tracking-tight text-slate-900 md:text-4xl">
-              CSV Normalisation Agent
-            </h1>
-            <p className="max-w-3xl text-sm text-slate-600 md:text-base">
-              Upload your input data and a target format example to automatically
-              map and normalise your CSV.
+    <main className="min-h-screen bg-slate-50 px-4 py-10 md:px-8">
+      <div className="mx-auto w-full max-w-6xl space-y-8">
+        <header className="space-y-3">
+          <h1 className="text-3xl font-semibold tracking-tight text-slate-900 md:text-4xl">
+            CSV Normalisation Agent
+          </h1>
+          <p className="max-w-3xl text-sm text-slate-600 md:text-base">
+            Upload your input data and a target format example to automatically
+            map and normalise your CSV.
           </p>
         </header>
+
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <Key className="h-4 w-4" />
+              Anthropic API Key
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {keyConnected ? (
+              <div className="flex items-center gap-3">
+                <div className="flex-1 rounded-md border bg-slate-50 px-3 py-2 text-sm text-slate-600">
+                  Connected: sk-ant-...{apiKey.slice(-4)}
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleDisconnectKey}
+                >
+                  Disconnect
+                </Button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1">
+                  <Input
+                    type={showKey ? "text" : "password"}
+                    placeholder="sk-ant-api03-..."
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleSaveKey();
+                    }}
+                  />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="absolute right-1 top-0 h-9 w-9"
+                    onClick={() => setShowKey(!showKey)}
+                    type="button"
+                    aria-label={showKey ? "Hide key" : "Show key"}
+                  >
+                    {showKey ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </Button>
+                </div>
+                <Button onClick={handleSaveKey} disabled={!apiKey.trim()}>
+                  Connect
+                </Button>
+              </div>
+            )}
+            <p className="mt-2 text-xs text-slate-500">
+              Your key is stored in your browser only and sent directly to the Anthropic API.
+              Get one at{" "}
+              <a
+                href="https://console.anthropic.com/settings/keys"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline"
+              >
+                console.anthropic.com
+              </a>
+            </p>
+          </CardContent>
+        </Card>
 
         {error && (
           <Alert className="animate-in fade-in-50 duration-300" variant="destructive">
@@ -551,7 +635,7 @@ export default function Home() {
         {stage === "upload" && (
           <Button
             className="w-full transition-all duration-300"
-            disabled={!inputSummary || !targetSummary || isLoading}
+            disabled={!inputSummary || !targetSummary || !keyConnected || isLoading}
             onClick={handleRunAgent}
           >
             {loadingAction === "agent" ? (
@@ -680,8 +764,7 @@ export default function Home() {
             </CardContent>
           </Card>
         )}
-        </div>
-      </main>
-    </>
+      </div>
+    </main>
   );
 }
