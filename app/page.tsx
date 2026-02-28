@@ -1,6 +1,8 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
+import { useSession } from "next-auth/react";
+import { useRouter } from "next/navigation";
 import { AlertCircle, FileText, Loader2, Upload, X } from "lucide-react";
 import Papa, { ParseResult } from "papaparse";
 import { z } from "zod";
@@ -17,6 +19,7 @@ import {
   TableHeader,
   TableRow
 } from "@/components/ui/table";
+import NavBar from "@/components/nav-bar";
 import { cn } from "@/lib/utils";
 import type { AgentResponse, Mapping } from "@/lib/schemas";
 import { ResponseSchema } from "@/lib/schemas";
@@ -96,6 +99,15 @@ const createPreviewRows = (csvText: string) => {
 };
 
 export default function Home() {
+  const { data: session, status } = useSession();
+  const router = useRouter();
+
+  useEffect(() => {
+    if (status === "unauthenticated") {
+      router.replace("/login");
+    }
+  }, [status, router]);
+
   const inputFileRef = useRef<HTMLInputElement>(null);
   const targetFileRef = useRef<HTMLInputElement>(null);
 
@@ -376,16 +388,30 @@ export default function Home() {
     URL.revokeObjectURL(url);
   };
 
+  if (status === "loading") {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-slate-50">
+        <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+      </main>
+    );
+  }
+
+  if (!session) {
+    return null;
+  }
+
   return (
-    <main className="min-h-screen bg-slate-50 px-4 py-10 md:px-8">
-      <div className="mx-auto w-full max-w-6xl space-y-8">
-        <header className="space-y-3">
-          <h1 className="text-3xl font-semibold tracking-tight text-slate-900 md:text-4xl">
-            CSV Normalisation Agent
-          </h1>
-          <p className="max-w-3xl text-sm text-slate-600 md:text-base">
-            Upload your input data and a target format example to automatically
-            map and normalise your CSV.
+    <>
+      <NavBar />
+      <main className="min-h-screen bg-slate-50 px-4 py-10 md:px-8">
+        <div className="mx-auto w-full max-w-6xl space-y-8">
+          <header className="space-y-3">
+            <h1 className="text-3xl font-semibold tracking-tight text-slate-900 md:text-4xl">
+              CSV Normalisation Agent
+            </h1>
+            <p className="max-w-3xl text-sm text-slate-600 md:text-base">
+              Upload your input data and a target format example to automatically
+              map and normalise your CSV.
           </p>
         </header>
 
@@ -654,7 +680,8 @@ export default function Home() {
             </CardContent>
           </Card>
         )}
-      </div>
-    </main>
+        </div>
+      </main>
+    </>
   );
 }

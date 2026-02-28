@@ -1,7 +1,10 @@
-import { anthropic } from "@ai-sdk/anthropic";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { generateObject } from "ai";
+import { getServerSession } from "next-auth";
 import Papa, { ParseResult } from "papaparse";
 
+import { getStoredApiKey } from "@/lib/api-key";
+import { authOptions } from "@/lib/auth";
 import { ResponseSchema } from "@/lib/schemas";
 
 const MAX_SAMPLE_ROWS = 10;
@@ -84,10 +87,21 @@ const isCsvUpload = (file: File) =>
   file.type === "application/vnd.ms-excel";
 
 export async function POST(request: Request) {
-  if (!process.env.ANTHROPIC_API_KEY) {
+  const session = await getServerSession(authOptions);
+  if (!session) {
     return Response.json(
-      { error: "Missing ANTHROPIC_API_KEY configuration." },
-      { status: 500 }
+      { error: "Please sign in to use the agent." },
+      { status: 401 }
+    );
+  }
+
+  const userApiKey = await getStoredApiKey();
+  const apiKey = userApiKey || process.env.ANTHROPIC_API_KEY;
+
+  if (!apiKey) {
+    return Response.json(
+      { error: "No API key found. Please add your Anthropic API key in Settings." },
+      { status: 400 }
     );
   }
 
@@ -150,6 +164,7 @@ export async function POST(request: Request) {
     }
 
     const prompt = buildPrompt({ inputCsv: parsedInput, targetCsv: parsedTarget });
+    const anthropic = createAnthropic({ apiKey });
 
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt += 1) {
       try {
