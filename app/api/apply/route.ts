@@ -2,11 +2,20 @@ import Papa from "papaparse";
 import { z } from "zod";
 
 import { MappingSchema } from "@/lib/schemas";
+import {
+  normalisePipeline,
+  type MappingInput
+} from "@/lib/normalize";
+
+// ── Request schema ───────────────────────────────────────────────────
 
 const ApplyRequestSchema = z.object({
   mappings: z.array(MappingSchema).min(1),
-  inputCsvData: z.array(z.record(z.string(), z.unknown())).min(1)
+  inputCsvData: z.array(z.record(z.string(), z.unknown())).min(1),
+  targetCsvData: z.array(z.record(z.string(), z.unknown())).default([])
 });
+
+// ── Structural transform helpers ─────────────────────────────────────
 
 const twoDigit = (value: number) => value.toString().padStart(2, "0");
 
@@ -23,9 +32,7 @@ const parseDateParts = (
   ruleHint: string
 ): { year: number; month: number; day: number } | null => {
   const trimmed = value.trim();
-  if (!trimmed) {
-    return null;
-  }
+  if (!trimmed) return null;
 
   const isoMatch = trimmed.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
   if (isoMatch) {
@@ -36,7 +43,9 @@ const parseDateParts = (
     };
   }
 
-  const localeMatch = trimmed.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/);
+  const localeMatch = trimmed.match(
+    /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})$/
+  );
   if (localeMatch) {
     const first = Number(localeMatch[1]);
     const second = Number(localeMatch[2]);
@@ -45,15 +54,11 @@ const parseDateParts = (
     const useMonthFirst = /mm\/dd|month.?first|us/i.test(ruleHint);
     const month = useMonthFirst ? first : second;
     const day = useMonthFirst ? second : first;
-
     return { year, month, day };
   }
 
   const parsed = new Date(trimmed);
-  if (Number.isNaN(parsed.getTime())) {
-    return null;
-  }
-
+  if (Number.isNaN(parsed.getTime())) return null;
   return {
     year: parsed.getUTCFullYear(),
     month: parsed.getUTCMonth() + 1,
@@ -63,41 +68,25 @@ const parseDateParts = (
 
 const formatDate = (value: string, rule: string) => {
   const parts = parseDateParts(value, rule);
-  if (!parts) {
-    return value.trim();
-  }
-
+  if (!parts) return value.trim();
   const { year, month, day } = parts;
-  if (/dd\/mm\/yyyy/i.test(rule)) {
+  if (/dd\/mm\/yyyy/i.test(rule))
     return `${twoDigit(day)}/${twoDigit(month)}/${year}`;
-  }
-  if (/mm\/dd\/yyyy/i.test(rule)) {
+  if (/mm\/dd\/yyyy/i.test(rule))
     return `${twoDigit(month)}/${twoDigit(day)}/${year}`;
-  }
-  if (/dd-mm-yyyy/i.test(rule)) {
+  if (/dd-mm-yyyy/i.test(rule))
     return `${twoDigit(day)}-${twoDigit(month)}-${year}`;
-  }
   return `${year}-${twoDigit(month)}-${twoDigit(day)}`;
 };
 
 const formatPhone = (value: string, rule: string) => {
   const digits = value.replace(/\D/g, "");
-  if (!digits) {
-    return "";
-  }
-
-  if (/e\.?164|\+\d+/i.test(rule)) {
-    return `+${digits}`;
-  }
-
-  if (digits.length === 10) {
+  if (!digits) return "";
+  if (/e\.?164|\+\d+/i.test(rule)) return `+${digits}`;
+  if (digits.length === 10)
     return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
-  }
-
-  if (digits.length === 11 && digits.startsWith("1")) {
+  if (digits.length === 11 && digits.startsWith("1"))
     return `+1 (${digits.slice(1, 4)}) ${digits.slice(4, 7)}-${digits.slice(7)}`;
-  }
-
   return digits;
 };
 
@@ -106,12 +95,8 @@ const formatNumber = (value: string, rule: string) => {
     .trim()
     .replace(/[^\d.,-]/g, "")
     .replace(/,/g, "");
-
   const numeric = Number(cleaned);
-  if (!Number.isFinite(numeric)) {
-    return value.trim();
-  }
-
+  if (!Number.isFinite(numeric)) return value.trim();
   const decimalMatch = rule.match(/(\d+)\s*decimal/i);
   const decimals = decimalMatch ? Number(decimalMatch[1]) : undefined;
   const shouldUseGrouping = /thousand|comma|separator/i.test(rule);
@@ -122,92 +107,61 @@ const formatNumber = (value: string, rule: string) => {
   });
   const formatted = formatter.format(numeric);
   const currencySymbol = rule.match(/[$£€]/)?.[0];
-
   return currencySymbol ? `${currencySymbol}${formatted}` : formatted;
 };
 
 const splitName = (value: string) => {
   const trimmed = value.trim();
-  if (!trimmed) {
-    return { firstName: "", lastName: "" };
-  }
-
+  if (!trimmed) return { firstName: "", lastName: "" };
   if (trimmed.includes(",")) {
-    const [lastName, firstName] = trimmed.split(",").map((part) => part.trim());
+    const [lastName, firstName] = trimmed.split(",").map((p) => p.trim());
     return { firstName: firstName ?? "", lastName: lastName ?? "" };
   }
-
   const parts = trimmed.split(/\s+/).filter(Boolean);
-  if (parts.length === 1) {
-    return { firstName: parts[0], lastName: "" };
-  }
-
-  return {
-    firstName: parts[0],
-    lastName: parts.slice(1).join(" ")
-  };
+  if (parts.length === 1) return { firstName: parts[0], lastName: "" };
+  return { firstName: parts[0], lastName: parts.slice(1).join(" ") };
 };
 
-const applyCustomRule = (value: string, rule: string, targetColumn: string) => {
+const applyCustomRule = (
+  value: string,
+  rule: string,
+  targetColumn: string
+) => {
   const hint = `${rule} ${targetColumn}`;
-  if (/trim/i.test(hint)) {
-    return value.trim();
-  }
-  if (/upper/i.test(hint)) {
-    return value.toUpperCase();
-  }
-  if (/lower/i.test(hint)) {
-    return value.toLowerCase();
-  }
-  if (/title/i.test(hint)) {
-    return titleCase(value);
-  }
-  if (/date/i.test(hint)) {
-    return formatDate(value, rule);
-  }
-  if (/phone|tel/i.test(hint)) {
-    return formatPhone(value, rule);
-  }
-  if (/number|currency|decimal|amount|price/i.test(hint)) {
+  if (/trim/i.test(hint)) return value.trim();
+  if (/upper/i.test(hint)) return value.toUpperCase();
+  if (/lower/i.test(hint)) return value.toLowerCase();
+  if (/title/i.test(hint)) return titleCase(value);
+  if (/date/i.test(hint)) return formatDate(value, rule);
+  if (/phone|tel/i.test(hint)) return formatPhone(value, rule);
+  if (/number|currency|decimal|amount|price/i.test(hint))
     return formatNumber(value, rule);
-  }
   return value.trim();
 };
 
-const transformValue = ({
-  value,
-  transformType,
-  rule,
-  targetColumn
-}: {
-  value: string;
-  transformType: z.infer<typeof MappingSchema>["transformType"];
-  rule: string;
-  targetColumn: string;
-}) => {
+// ── Structural transform dispatcher ──────────────────────────────────
+
+const structuralTransform = (
+  value: string,
+  mapping: MappingInput
+): string => {
+  const { transformType, normalisationRule: rule, targetColumn } = mapping;
+
   switch (transformType) {
     case "rename":
       return value;
     case "date_format":
       return formatDate(value, rule);
     case "casing":
-      if (/upper/i.test(rule)) {
-        return value.toUpperCase();
-      }
-      if (/lower/i.test(rule)) {
-        return value.toLowerCase();
-      }
+      if (/upper/i.test(rule)) return value.toUpperCase();
+      if (/lower/i.test(rule)) return value.toLowerCase();
       return titleCase(value);
     case "phone_format":
       return formatPhone(value, rule);
     case "name_split": {
       const split = splitName(value);
-      if (/first/i.test(targetColumn)) {
-        return split.firstName;
-      }
-      if (/last|surname|family/i.test(targetColumn)) {
-        return split.lastName;
-      }
+      if (/first/i.test(targetColumn)) return split.firstName;
+      if (/last|surname|family/i.test(targetColumn)) return split.lastName;
       return `${split.firstName} ${split.lastName}`.trim();
     }
     case "number_format":
@@ -221,8 +175,11 @@ const transformValue = ({
   }
 };
 
+// ── Route handler ────────────────────────────────────────────────────
+
 export async function POST(request: Request) {
   try {
+    const apiKey = request.headers.get("x-api-key")?.trim() || null;
     const payload = await request.json();
     const parsedBody = ApplyRequestSchema.safeParse(payload);
 
@@ -233,27 +190,30 @@ export async function POST(request: Request) {
       );
     }
 
-    const { mappings, inputCsvData } = parsedBody.data;
+    const { mappings, inputCsvData, targetCsvData } = parsedBody.data;
 
-    const targetColumns = Array.from(
-      new Set(mappings.map((mapping) => mapping.targetColumn))
+    const inputRows = inputCsvData.map((row) =>
+      Object.fromEntries(
+        Object.entries(row).map(([k, v]) => [k, String(v ?? "")])
+      )
     );
 
-    const transformedRows = inputCsvData.map((row) => {
-      const outputRow: Record<string, string> = {};
+    const targetRows = targetCsvData.map((row) =>
+      Object.fromEntries(
+        Object.entries(row).map(([k, v]) => [k, String(v ?? "")])
+      )
+    );
 
-      for (const mapping of mappings) {
-        const sourceValue = row[mapping.inputColumn];
-        const value = sourceValue == null ? "" : String(sourceValue);
-        outputRow[mapping.targetColumn] = transformValue({
-          value,
-          transformType: mapping.transformType,
-          rule: mapping.normalisationRule,
-          targetColumn: mapping.targetColumn
-        });
-      }
+    const targetColumns = Array.from(
+      new Set(mappings.map((m) => m.targetColumn))
+    );
 
-      return outputRow;
+    const { rows: transformedRows, stats } = await normalisePipeline({
+      mappings,
+      inputRows,
+      targetRows,
+      apiKey,
+      structuralTransform
     });
 
     const csv = Papa.unparse({
@@ -266,7 +226,8 @@ export async function POST(request: Request) {
       summary: {
         rowCount: transformedRows.length,
         columnCount: targetColumns.length
-      }
+      },
+      normalisationStats: stats
     });
   } catch {
     return Response.json(

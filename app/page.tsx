@@ -40,12 +40,25 @@ const MAX_AGENT_ATTEMPTS = 2;
 const PREVIEW_ROWS = 10;
 const API_KEY_STORAGE_KEY = "anthropic-api-key";
 
+const ColumnStatsSchema = z.object({
+  column: z.string(),
+  exact: z.number(),
+  fuzzy: z.number(),
+  llm: z.number(),
+  structural: z.number(),
+  passthrough: z.number(),
+  total: z.number()
+});
+
+type ColumnStats = z.infer<typeof ColumnStatsSchema>;
+
 const ApplyResponseSchema = z.object({
   csv: z.string(),
   summary: z.object({
     rowCount: z.number(),
     columnCount: z.number()
-  })
+  }),
+  normalisationStats: z.array(ColumnStatsSchema).optional()
 });
 
 const isCsvFile = (file: File) =>
@@ -113,6 +126,7 @@ export default function Home() {
   const [outputCsv, setOutputCsv] = useState("");
   const [outputSummary, setOutputSummary] = useState<OutputSummary | null>(null);
   const [outputPreview, setOutputPreview] = useState<Record<string, string>[]>([]);
+  const [normalisationStats, setNormalisationStats] = useState<ColumnStats[]>([]);
   const [stage, setStage] = useState<Stage>("upload");
   const [isLoading, setIsLoading] = useState(false);
   const [loadingAction, setLoadingAction] = useState<"agent" | "apply" | null>(null);
@@ -154,6 +168,7 @@ export default function Home() {
     setOutputCsv("");
     setOutputSummary(null);
     setOutputPreview([]);
+    setNormalisationStats([]);
     setStage("upload");
   };
 
@@ -351,7 +366,7 @@ export default function Home() {
   };
 
   const handleApproveAndApply = async () => {
-    if (!inputParsed || editableMappings.length === 0) {
+    if (!inputParsed || !targetParsed || editableMappings.length === 0) {
       setError("No mapping plan is available to apply.");
       return;
     }
@@ -361,14 +376,21 @@ export default function Home() {
     setLoadingAction("apply");
 
     try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json"
+      };
+      const storedKey = localStorage.getItem(API_KEY_STORAGE_KEY);
+      if (storedKey) {
+        headers["x-api-key"] = storedKey;
+      }
+
       const response = await fetch("/api/apply", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        headers,
         body: JSON.stringify({
           mappings: editableMappings,
-          inputCsvData: inputParsed.rows
+          inputCsvData: inputParsed.rows,
+          targetCsvData: targetParsed.rows
         })
       });
 
@@ -390,6 +412,7 @@ export default function Home() {
       setOutputCsv(validated.data.csv);
       setOutputSummary(validated.data.summary);
       setOutputPreview(previewRows);
+      setNormalisationStats(validated.data.normalisationStats ?? []);
       setStage("result");
     } catch (applyError) {
       setError(
@@ -703,7 +726,7 @@ export default function Home() {
                   {loadingAction === "apply" ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      Applying...
+                      Normalising (exact / fuzzy / LLM)...
                     </>
                   ) : (
                     "Approve & Apply"
@@ -729,6 +752,70 @@ export default function Home() {
               <p className="text-sm text-slate-700">
                 {outputSummary.rowCount} rows • {outputSummary.columnCount} columns
               </p>
+
+              {normalisationStats.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-sm font-medium text-slate-800">
+                    Normalisation Pipeline Breakdown
+                  </p>
+                  <div className="rounded-md border">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead>Column</TableHead>
+                          <TableHead className="text-center">Exact Match</TableHead>
+                          <TableHead className="text-center">Fuzzy Match</TableHead>
+                          <TableHead className="text-center">LLM Reasoning</TableHead>
+                          <TableHead className="text-center">Structural</TableHead>
+                          <TableHead className="text-center">Total</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {normalisationStats.map((stat) => (
+                          <TableRow key={stat.column}>
+                            <TableCell className="font-medium">{stat.column}</TableCell>
+                            <TableCell className="text-center">
+                              {stat.exact > 0 && (
+                                <span className="inline-block rounded-full bg-green-100 px-2 py-0.5 text-xs font-medium text-green-800">
+                                  {stat.exact}
+                                </span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-center">
+                              {stat.fuzzy > 0 && (
+                                <span className="inline-block rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                                  {stat.fuzzy}
+                                </span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-center">
+                              {stat.llm > 0 && (
+                                <span className="inline-block rounded-full bg-purple-100 px-2 py-0.5 text-xs font-medium text-purple-800">
+                                  {stat.llm}
+                                </span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-center">
+                              {stat.structural > 0 && (
+                                <span className="inline-block rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">
+                                  {stat.structural}
+                                </span>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-center text-xs text-slate-500">
+                              {stat.total}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    Exact = matched target value directly. Fuzzy = close string match.
+                    LLM = Claude reasoned over the value. Structural = format transform (dates, numbers, etc.).
+                  </p>
+                </div>
+              )}
 
               {outputPreview.length > 0 ? (
                 <div className="rounded-md border">
