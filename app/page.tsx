@@ -36,7 +36,8 @@ type Stage = "upload" | "review" | "result";
 type OutputSummary = { rowCount: number; columnCount: number };
 
 const CSV_MIME_TYPES = new Set(["text/csv", "application/vnd.ms-excel"]);
-const MAX_AGENT_ATTEMPTS = 2;
+const MAX_AGENT_ATTEMPTS = 3;
+const FETCH_TIMEOUT_MS = 100_000;
 const PREVIEW_ROWS = 10;
 const API_KEY_STORAGE_KEY = "anthropic-api-key";
 
@@ -70,8 +71,14 @@ const parseCsv = (file: File) =>
       header: true,
       skipEmptyLines: true,
       complete: (results) => {
-        if (results.errors.length > 0) {
-          reject(new Error(results.errors[0]?.message || "Unable to parse CSV"));
+        // Only reject on fatal parse errors (bad quoting, bad delimiter).
+        // Ignore non-fatal warnings like TooFewFields / TooManyFields which
+        // are common in real-world CSVs with trailing commas or ragged rows.
+        const fatalErrors = results.errors.filter(
+          (e) => e.type === "Quotes" || e.type === "Delimiter"
+        );
+        if (fatalErrors.length > 0) {
+          reject(new Error(fatalErrors[0].message || "Unable to parse CSV"));
           return;
         }
 
@@ -279,11 +286,17 @@ export default function Home() {
       headers["x-api-key"] = storedKey;
     }
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
     const response = await fetch("/api/process", {
       method: "POST",
       headers,
-      body: payload
+      body: payload,
+      signal: controller.signal
     });
+
+    clearTimeout(timeout);
 
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -334,9 +347,10 @@ export default function Home() {
           runError,
           "The mapping agent could not complete your request."
         );
-        const shouldRetry =
-          /response was invalid|invalid mapping plan/i.test(lastError);
-        if (!shouldRetry || attempt === MAX_AGENT_ATTEMPTS) {
+        // Don't retry on client-side validation or auth errors
+        const noRetry =
+          /api key|empty|both csv|cannot be empty/i.test(lastError);
+        if (noRetry || attempt === MAX_AGENT_ATTEMPTS) {
           break;
         }
       }
@@ -384,6 +398,12 @@ export default function Home() {
         headers["x-api-key"] = storedKey;
       }
 
+      const applyController = new AbortController();
+      const applyTimeout = setTimeout(
+        () => applyController.abort(),
+        FETCH_TIMEOUT_MS
+      );
+
       const response = await fetch("/api/apply", {
         method: "POST",
         headers,
@@ -391,8 +411,11 @@ export default function Home() {
           mappings: editableMappings,
           inputCsvData: inputParsed.rows,
           targetCsvData: targetParsed.rows
-        })
+        }),
+        signal: applyController.signal
       });
+
+      clearTimeout(applyTimeout);
 
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {

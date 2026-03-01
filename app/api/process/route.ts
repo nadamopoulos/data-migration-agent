@@ -20,8 +20,14 @@ const parseCsvText = (csvText: string): ParsedCsv => {
     skipEmptyLines: true
   });
 
-  if (result.errors.length > 0) {
-    throw new Error("CSV parsing failed.");
+  // Only throw on fatal errors (MissingQuotes, etc.)
+  // Ignore non-fatal warnings like TooFewFields / TooManyFields which are
+  // common in real-world CSVs and don't prevent usable parsing.
+  const fatalErrors = result.errors.filter(
+    (e) => e.type === "Quotes" || e.type === "Delimiter"
+  );
+  if (fatalErrors.length > 0) {
+    throw new Error(`CSV parsing failed: ${fatalErrors[0].message}`);
   }
 
   const headers = (result.meta.fields ?? []).map((header) => header.trim());
@@ -160,11 +166,17 @@ export async function POST(request: Request) {
     let lastError = "";
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt += 1) {
       try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 45_000);
+
         const result = await generateObject({
           model: anthropic("claude-sonnet-4-5"),
           schema: ResponseSchema,
-          prompt
+          prompt,
+          abortSignal: controller.signal
         });
+
+        clearTimeout(timeout);
 
         const validated = ResponseSchema.safeParse(result.object);
         if (!validated.success) {
