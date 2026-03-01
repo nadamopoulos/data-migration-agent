@@ -57,7 +57,7 @@ type ResolvedValue = {
 
 // ── Constants ────────────────────────────────────────────────────────
 
-const FUZZY_THRESHOLD = 0.7;
+const FUZZY_THRESHOLD = 0.85;
 const LLM_BATCH_SIZE = 100;
 const LLM_CONCURRENCY = 5;
 const LLM_CALL_TIMEOUT_MS = 90_000;
@@ -124,6 +124,86 @@ function fuzzyMatch(
   return bestMatch;
 }
 
+// ── Column rule inference ────────────────────────────────────────────
+
+const ColumnRulesSchema = z.object({
+  rules: z.array(
+    z.object({
+      column: z.string(),
+      formatRule: z.string()
+    })
+  )
+});
+
+function buildRuleInferencePrompt(
+  columns: { name: string; examples: string[]; hint: string }[]
+): string {
+  const columnsBlock = columns
+    .map(
+      (c) =>
+        `- Column "${c.name}":\n  Reference examples: ${JSON.stringify(c.examples)}\n  Mapping hint: "${c.hint}"`
+    )
+    .join("\n");
+
+  return `You are a data format analyst. For each column below, you are given a few EXAMPLE values from a target system. These examples illustrate the expected format — they are NOT an exhaustive list of allowed values. Infer the precise format rule that governs them.
+
+${columnsBlock}
+
+For each column, produce a formatRule: a specific, unambiguous instruction that describes how to normalise ANY input value into the correct format. The rule must capture:
+- The exact format pattern (e.g. "BCP-47 locale codes in xx-XX format")
+- The casing convention (e.g. "Title Case", "lowercase", "UPPERCASE")
+- The naming convention and structure (e.g. "AWS region codes like us-east-1")
+- The value domain if it is a closed enumeration — list ALL valid values explicitly, not just the examples
+- How to handle abbreviations, synonyms, codes, and foreign-language labels
+
+Be extremely specific. "Match target format" is NOT a valid rule.
+
+Good example rules:
+- "BCP-47 locale codes: two-letter lowercase language, hyphen, two-letter uppercase region (e.g. en-US, fr-FR, ja-JP). Map language names, native scripts, and legacy locale codes to their BCP-47 equivalent."
+- "Title Case status from closed set: Active, Inactive, Deprecated, Pending, Under Review. Map boolean-like values (yes/no/true/false/1/0/enabled/disabled) to Active or Inactive."
+- "AWS region format: {area}-{direction}-{number} e.g. us-east-1, eu-central-1, ap-southeast-1. Map friendly names, abbreviations, and data-centre codes to the canonical AWS region code."
+- "Priority scale P1 (critical/highest) through P5 (lowest/trivial). Map severity labels, numbers, and shorthand to the P1–P5 scale."
+- "Title Case full environment name from set: Production, Development, Staging, QA, UAT. Map abbreviations (prod, dev, stg) and variants to the canonical name."`;
+}
+
+async function inferColumnRules(
+  columns: { name: string; examples: string[]; hint: string }[],
+  apiKey: string,
+  limiter: Limiter
+): Promise<Map<string, string>> {
+  if (columns.length === 0) return new Map();
+
+  return limiter(async () => {
+    try {
+      const anthropic = createAnthropic({ apiKey });
+      const controller = new AbortController();
+      const timeout = setTimeout(
+        () => controller.abort(),
+        LLM_CALL_TIMEOUT_MS
+      );
+      const result = await generateObject({
+        model: anthropic("claude-sonnet-4-5"),
+        schema: ColumnRulesSchema,
+        prompt: buildRuleInferencePrompt(columns),
+        abortSignal: controller.signal
+      });
+      clearTimeout(timeout);
+
+      const rulesMap = new Map<string, string>();
+      for (const rule of result.object.rules) {
+        rulesMap.set(rule.column, rule.formatRule);
+      }
+      return rulesMap;
+    } catch (err) {
+      console.error(
+        "[normalise] Column rule inference failed:",
+        err instanceof Error ? err.message : err
+      );
+      return new Map();
+    }
+  });
+}
+
 // ── Stage 3: LLM batch normalisation ─────────────────────────────────
 
 const LlmNormalisationSchema = z.object({
@@ -137,39 +217,33 @@ const LlmNormalisationSchema = z.object({
 
 function buildLlmPrompt(
   batch: string[],
-  targetValues: string[],
+  targetExamples: string[],
   columnName: string,
+  formatRule: string,
   normalisationRule: string
 ): string {
-  return `You are a data normalisation expert. Your ONLY job: map each messy input value to the EXACT correct target value for the "${columnName}" column.
+  const rule =
+    formatRule ||
+    normalisationRule ||
+    "Transform each value to match the format shown in the reference examples.";
 
-ALLOWED TARGET VALUES for "${columnName}":
-${JSON.stringify(targetValues.slice(0, 150), null, 2)}
+  return `You are a data normalisation expert. Transform each input value for the "${columnName}" column according to the format rule below.
 
-NORMALISATION RULE: ${normalisationRule || "Map each value to the closest matching target value."}
+FORMAT RULE for "${columnName}":
+${rule}
 
-INPUT VALUES (map each one):
+REFERENCE EXAMPLES (showing the correct output format — these are NOT the only allowed values):
+${JSON.stringify(targetExamples.slice(0, 50), null, 2)}
+
+INPUT VALUES to normalise:
 ${JSON.stringify(batch, null, 2)}
 
-CRITICAL RULES — follow these strictly:
-1. ALWAYS output one of the ALLOWED TARGET VALUES above when possible. Copy the target value EXACTLY (same casing, spacing, punctuation). This is the most important rule.
-2. Resolve abbreviations, codes, aliases, typos, and foreign-language labels to the correct target value:
-   - "US"/"USA"/"United States of America" → whichever target value represents the US
-   - "Jammy"/"jammy"/"Ubuntu 22.04" → the matching Ubuntu target value
-   - "RHEL 9"/"RH9"/"RedHat 9.x" → the matching Red Hat target value
-   - "WS2022"/"WinSrv2022"/"Win 2022 Server" → the matching Windows Server target value
-   - "spa"/"SPA"/"Spanisch"/"spanish"/"es_ES" → the matching Spanish language target value
-   - "日本語"/"ja_JP"/"japanese"/"jpn" → the matching Japanese target value
-   - "yes"/"true"/"1"/"on"/"active"/"enabled"/"y" → the target's active/true value
-   - "no"/"false"/"0"/"off"/"inactive"/"disabled"/"n" → the target's inactive/false value
-   - "P"/"I"/"A" single-letter codes → infer meaning from column context
-   - "prod"/"production"/"live"/"p" → the target's production value
-   - "dev"/"development"/"d" → the target's dev value
-   - "uat"/"staging"/"qa"/"quality assurance"/"test"/"testing" → appropriate target value
-   - "sev1"/"critical"/"p1"/"1" → target's highest severity
-   - "sev3"/"minor"/"p4"/"low"/"4" → target's lowest severity
-3. If a value CANNOT map to any existing target value, produce a value that matches the STYLE and FORMAT PATTERN of the target values (same casing convention, same naming pattern, same level of detail).
-4. Every input MUST produce a meaningful output — never return the input unchanged unless it already matches a target value exactly.
+INSTRUCTIONS:
+1. Apply the FORMAT RULE to transform every input value into the correct format. The output must follow the exact same pattern as the reference examples.
+2. You are NOT limited to only the reference example values. Any value that follows the format rule is valid output.
+3. Resolve abbreviations, codes, aliases, typos, and foreign-language labels to their normalised form following the format rule.
+4. If the input is already in the correct format, return it unchanged.
+5. Every input MUST produce a meaningful output — never return the input unchanged unless it already matches the format rule exactly.
 
 Return ALL ${batch.length} input values.`;
 }
@@ -179,6 +253,7 @@ async function llmBatchNormalise(
   targetValues: string[],
   columnName: string,
   normalisationRule: string,
+  formatRule: string,
   apiKey: string,
   limiter: Limiter
 ): Promise<Map<string, string>> {
@@ -198,6 +273,7 @@ async function llmBatchNormalise(
           batch,
           targetValues,
           columnName,
+          formatRule,
           normalisationRule
         );
         try {
@@ -260,7 +336,8 @@ async function processColumn(
   targetLookup: Map<string, string>,
   apiKey: string | null,
   structuralTransform: (value: string, mapping: MappingInput) => string,
-  limiter: Limiter
+  limiter: Limiter,
+  formatRule: string
 ): Promise<ColumnResult> {
   const stats: ColumnStats = {
     column: mapping.targetColumn,
@@ -348,6 +425,7 @@ async function processColumn(
       targetValues,
       mapping.targetColumn,
       mapping.normalisationRule,
+      formatRule,
       apiKey,
       limiter
     );
@@ -425,6 +503,33 @@ export async function normalisePipeline(
     targetData.set(mapping.targetColumn, { values, lookup });
   }
 
+  // Infer format rules from target reference examples
+  let columnRules = new Map<string, string>();
+  if (apiKey) {
+    const seen = new Set<string>();
+    const columnsForRuleInference = mappings
+      .filter((m) => !STRUCTURAL_TYPES.has(m.transformType))
+      .filter((m) => {
+        if (seen.has(m.targetColumn)) return false;
+        seen.add(m.targetColumn);
+        return true;
+      })
+      .map((m) => ({
+        name: m.targetColumn,
+        examples: targetData.get(m.targetColumn)?.values ?? [],
+        hint: m.normalisationRule
+      }))
+      .filter((c) => c.examples.length > 0);
+
+    if (columnsForRuleInference.length > 0) {
+      columnRules = await inferColumnRules(
+        columnsForRuleInference,
+        apiKey,
+        limiter
+      );
+    }
+  }
+
   // Process ALL columns in parallel
   const columnResults = await Promise.all(
     mappings.map((mapping) => {
@@ -439,7 +544,8 @@ export async function normalisePipeline(
         lookup,
         apiKey,
         structuralTransform,
-        limiter
+        limiter,
+        columnRules.get(mapping.targetColumn) ?? ""
       );
     })
   );
