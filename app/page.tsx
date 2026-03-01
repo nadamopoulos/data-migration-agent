@@ -37,7 +37,6 @@ type OutputSummary = { rowCount: number; columnCount: number };
 
 const CSV_MIME_TYPES = new Set(["text/csv", "application/vnd.ms-excel"]);
 const MAX_AGENT_ATTEMPTS = 3;
-const FETCH_TIMEOUT_MS = 100_000;
 const PREVIEW_ROWS = 10;
 const API_KEY_STORAGE_KEY = "anthropic-api-key";
 
@@ -286,17 +285,11 @@ export default function Home() {
       headers["x-api-key"] = storedKey;
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
     const response = await fetch("/api/process", {
       method: "POST",
       headers,
-      body: payload,
-      signal: controller.signal
+      body: payload
     });
-
-    clearTimeout(timeout);
 
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -398,12 +391,6 @@ export default function Home() {
         headers["x-api-key"] = storedKey;
       }
 
-      const applyController = new AbortController();
-      const applyTimeout = setTimeout(
-        () => applyController.abort(),
-        FETCH_TIMEOUT_MS
-      );
-
       const response = await fetch("/api/apply", {
         method: "POST",
         headers,
@@ -411,11 +398,8 @@ export default function Home() {
           mappings: editableMappings,
           inputCsvData: inputParsed.rows,
           targetCsvData: targetParsed.rows
-        }),
-        signal: applyController.signal
+        })
       });
-
-      clearTimeout(applyTimeout);
 
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {

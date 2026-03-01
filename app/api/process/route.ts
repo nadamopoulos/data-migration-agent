@@ -167,7 +167,7 @@ export async function POST(request: Request) {
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt += 1) {
       try {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 45_000);
+        const timeout = setTimeout(() => controller.abort(), 55_000);
 
         const result = await generateObject({
           model: anthropic("claude-sonnet-4-5"),
