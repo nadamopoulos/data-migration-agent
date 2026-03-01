@@ -57,9 +57,7 @@ type ResolvedValue = {
 
 // ── Constants ────────────────────────────────────────────────────────
 
-const CATEGORICAL_MAX_UNIQUE = 200;
-const CATEGORICAL_MAX_RATIO = 0.5;
-const FUZZY_THRESHOLD = 0.75;
+const FUZZY_THRESHOLD = 0.7;
 const LLM_BATCH_SIZE = 80;
 const STRUCTURAL_TYPES = new Set([
   "date_format",
@@ -67,17 +65,6 @@ const STRUCTURAL_TYPES = new Set([
   "number_format",
   "name_split"
 ]);
-
-// ── Heuristics ───────────────────────────────────────────────────────
-
-function isCategorical(
-  uniqueValues: string[],
-  totalRows: number
-): boolean {
-  if (uniqueValues.length === 0 || totalRows === 0) return false;
-  if (uniqueValues.length > CATEGORICAL_MAX_UNIQUE) return false;
-  return uniqueValues.length / totalRows <= CATEGORICAL_MAX_RATIO;
-}
 
 // ── Stage 1: Exact match (case-insensitive) ──────────────────────────
 
@@ -138,27 +125,31 @@ async function llmBatchNormalise(
   for (let i = 0; i < unmatchedValues.length; i += LLM_BATCH_SIZE) {
     const batch = unmatchedValues.slice(i, i + LLM_BATCH_SIZE);
 
-    const prompt = `You are a data normalisation expert. Your task is to map input values so they match the format and vocabulary of a target dataset column.
+    const prompt = `You are a data normalisation expert migrating messy source data into a clean target schema.
 
-Target column: "${columnName}"
-Normalisation context: ${normalisationRule || "Match the target values as closely as possible."}
+TARGET COLUMN: "${columnName}"
+RULE / CONTEXT: ${normalisationRule || "Normalise each value to match the target vocabulary and format."}
 
-Known valid target values (reference examples from the target dataset):
-${JSON.stringify(targetValues.slice(0, 100), null, 2)}
+REFERENCE — the target dataset uses these values for this column:
+${JSON.stringify(targetValues.slice(0, 150), null, 2)}
 
-Input values that need normalisation:
+INPUT VALUES to normalise (each must produce exactly one output):
 ${JSON.stringify(batch, null, 2)}
 
-For each input value determine the correct normalised output. Consider:
-- Abbreviations and expansions (e.g. "US" → "United States", "M" → "Male", "NY" → "New York")
-- Spelling variations and typos (e.g. "colour" → "color", "Untied States" → "United States")
-- Different representations of the same concept (e.g. "NYC" → "New York City", "1st" → "First")
-- Format differences (e.g. "john doe" → "John Doe", "01/02" → "January 2")
-- Domain-specific mappings based on the column context
+NORMALISATION GUIDELINES:
+1. If the input value is an obvious match for one of the reference target values, output that EXACT target value (preserve casing, spacing, punctuation).
+2. Recognise abbreviations, codes, aliases, and foreign-language labels:
+   - Country / region: "US" → "United States", "DE" → "Germany"
+   - OS names & codenames: "Jammy" → "Ubuntu 22.04 LTS", "Ws2022" → "Windows Server 2022", "RHEL 9" → "Red Hat Enterprise Linux 9"
+   - Language codes: "spa" → the target representation (e.g. "es" or "Spanish"), "spanisch" (German for Spanish) → correct target value, "zh_cn" → "zh-CN"
+   - Boolean / status: "yes"/"true"/"1"/"on"/"active" → the target's active value; "no"/"false"/"0"/"off"/"inactive"/"disabled" → the target's inactive value; ambiguous flags like "p"/"i"/"a" → infer from column context
+   - Environment: "prod"/"production"/"live"/"p" → target's production value; "dev"/"development"/"d" → target's dev value; "uat"/"staging"/"qa"/"quality assurance" → appropriate target value
+   - Severity / priority: "sev1"/"critical"/"p1" → target's highest severity; "sev3"/"minor"/"p4"/"low" → target's lowest
+3. Typos and near-misses: fix obvious misspellings ("Untied" → "United", "Winodws" → "Windows").
+4. If no reference target value fits, produce a value that matches the STYLE (casing, format pattern) of the reference values.
+5. Never leave a value unnormalised — every input must map to a meaningful output.
 
-IMPORTANT: If an input value clearly maps to one of the known target values use that exact target value. If there is no reasonable match, format the value to match the general style and pattern of the target values.
-
-Return ALL input values with their normalised output.`;
+Return ALL input values.`;
 
     try {
       const anthropic = createAnthropic({ apiKey });
@@ -238,11 +229,9 @@ export async function normalisePipeline(
     }
 
     const isStructural = STRUCTURAL_TYPES.has(mapping.transformType);
-    const categorical = isCategorical(targetValues, targetRows.length);
-    const useValueMatching =
-      categorical && !isStructural && targetValues.length > 0;
+    const useValueMatching = !isStructural && targetValues.length > 0;
 
-    // ── Structural-only path ──
+    // ── Structural-only path (dates, phones, numbers, name splits) ──
     if (!useValueMatching) {
       for (let i = 0; i < inputRows.length; i++) {
         const raw = inputRows[i][mapping.inputColumn] ?? "";
