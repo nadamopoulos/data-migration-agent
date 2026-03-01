@@ -4,7 +4,7 @@ import Papa, { ParseResult } from "papaparse";
 
 import { ResponseSchema } from "@/lib/schemas";
 
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 const MAX_SAMPLE_ROWS = 10;
 const MAX_GENERATION_ATTEMPTS = 3;

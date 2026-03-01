@@ -58,8 +58,9 @@ type ResolvedValue = {
 // ── Constants ────────────────────────────────────────────────────────
 
 const FUZZY_THRESHOLD = 0.7;
-const LLM_BATCH_SIZE = 120;
-const LLM_CONCURRENCY = 6;
+const LLM_BATCH_SIZE = 200;
+const LLM_CONCURRENCY = 8;
+const LLM_CALL_TIMEOUT_MS = 30_000;
 const STRUCTURAL_TYPES = new Set([
   "date_format",
   "phone_format",
@@ -195,11 +196,18 @@ async function llmBatchNormalise(
         );
         try {
           const anthropic = createAnthropic({ apiKey });
+          const controller = new AbortController();
+          const timeout = setTimeout(
+            () => controller.abort(),
+            LLM_CALL_TIMEOUT_MS
+          );
           const result = await generateObject({
-            model: anthropic("claude-sonnet-4-5"),
+            model: anthropic("claude-haiku-4-5"),
             schema: LlmNormalisationSchema,
-            prompt
+            prompt,
+            abortSignal: controller.signal
           });
+          clearTimeout(timeout);
           const map = new Map<string, string>();
           for (const item of result.object.normalizedValues) {
             map.set(item.input, item.output);

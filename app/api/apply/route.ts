@@ -177,7 +177,7 @@ const structuralTransform = (
 
 // ── Route config ────────────────────────────────────────────────────
 
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 // ── Route handler ────────────────────────────────────────────────────
 
@@ -233,9 +233,11 @@ export async function POST(request: Request) {
       },
       normalisationStats: stats
     });
-  } catch {
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Unknown error";
     return Response.json(
-      { error: "Unable to apply mapping plan to the CSV data." },
+      { error: `Unable to apply mapping plan: ${message}` },
       { status: 500 }
     );
   }
