@@ -342,7 +342,7 @@ export default function Home() {
         );
         // Don't retry on client-side validation or auth errors
         const noRetry =
-          /api key|empty|both csv|cannot be empty/i.test(lastError);
+          /api key|empty|both csv|cannot be empty|Unable to generate|could not process/i.test(lastError);
         if (noRetry || attempt === MAX_AGENT_ATTEMPTS) {
           break;
         }

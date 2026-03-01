@@ -183,7 +183,8 @@ export const maxDuration = 300;
 
 export async function POST(request: Request) {
   try {
-    const apiKey = request.headers.get("x-api-key")?.trim() || null;
+    const headerKey = request.headers.get("x-api-key")?.trim();
+    const apiKey = headerKey || process.env.ANTHROPIC_API_KEY || null;
     const payload = await request.json();
     const parsedBody = ApplyRequestSchema.safeParse(payload);
 

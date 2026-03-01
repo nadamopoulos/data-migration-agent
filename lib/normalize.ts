@@ -62,6 +62,8 @@ const LLM_BATCH_SIZE = 100;
 const LLM_CONCURRENCY = 5;
 const LLM_CALL_TIMEOUT_MS = 90_000;
 const STRUCTURAL_TYPES = new Set([
+  "rename",
+  "trim",
   "date_format",
   "phone_format",
   "number_format",
@@ -191,7 +193,7 @@ async function inferColumnRules(
 
       const rulesMap = new Map<string, string>();
       for (const rule of result.object.rules) {
-        rulesMap.set(rule.column, rule.formatRule);
+        rulesMap.set(rule.column.toLowerCase().trim(), rule.formatRule);
       }
       return rulesMap;
     } catch (err) {
@@ -545,7 +547,7 @@ export async function normalisePipeline(
         apiKey,
         structuralTransform,
         limiter,
-        columnRules.get(mapping.targetColumn) ?? ""
+        columnRules.get(mapping.targetColumn.toLowerCase().trim()) ?? ""
       );
     })
   );
