@@ -58,9 +58,9 @@ type ResolvedValue = {
 // ── Constants ────────────────────────────────────────────────────────
 
 const FUZZY_THRESHOLD = 0.7;
-const LLM_BATCH_SIZE = 200;
-const LLM_CONCURRENCY = 8;
-const LLM_CALL_TIMEOUT_MS = 30_000;
+const LLM_BATCH_SIZE = 100;
+const LLM_CONCURRENCY = 5;
+const LLM_CALL_TIMEOUT_MS = 90_000;
 const STRUCTURAL_TYPES = new Set([
   "date_format",
   "phone_format",
@@ -141,31 +141,37 @@ function buildLlmPrompt(
   columnName: string,
   normalisationRule: string
 ): string {
-  return `You are a data normalisation expert migrating messy source data into a clean target schema.
+  return `You are a data normalisation expert. Your ONLY job: map each messy input value to the EXACT correct target value for the "${columnName}" column.
 
-TARGET COLUMN: "${columnName}"
-RULE / CONTEXT: ${normalisationRule || "Normalise each value to match the target vocabulary and format."}
-
-REFERENCE — the target dataset uses these values for this column:
+ALLOWED TARGET VALUES for "${columnName}":
 ${JSON.stringify(targetValues.slice(0, 150), null, 2)}
 
-INPUT VALUES to normalise (each must produce exactly one output):
+NORMALISATION RULE: ${normalisationRule || "Map each value to the closest matching target value."}
+
+INPUT VALUES (map each one):
 ${JSON.stringify(batch, null, 2)}
 
-NORMALISATION GUIDELINES:
-1. If the input value is an obvious match for one of the reference target values, output that EXACT target value (preserve casing, spacing, punctuation).
-2. Recognise abbreviations, codes, aliases, and foreign-language labels:
-   - Country / region: "US" → "United States", "DE" → "Germany"
-   - OS names & codenames: "Jammy" → "Ubuntu 22.04 LTS", "Ws2022" → "Windows Server 2022", "RHEL 9" → "Red Hat Enterprise Linux 9"
-   - Language codes: "spa" → the target representation (e.g. "es" or "Spanish"), "spanisch" (German for Spanish) → correct target value, "zh_cn" → "zh-CN"
-   - Boolean / status: "yes"/"true"/"1"/"on"/"active" → the target's active value; "no"/"false"/"0"/"off"/"inactive"/"disabled" → the target's inactive value; ambiguous flags like "p"/"i"/"a" → infer from column context
-   - Environment: "prod"/"production"/"live"/"p" → target's production value; "dev"/"development"/"d" → target's dev value; "uat"/"staging"/"qa"/"quality assurance" → appropriate target value
-   - Severity / priority: "sev1"/"critical"/"p1" → target's highest severity; "sev3"/"minor"/"p4"/"low" → target's lowest
-3. Typos and near-misses: fix obvious misspellings ("Untied" → "United", "Winodws" → "Windows").
-4. If no reference target value fits, produce a value that matches the STYLE (casing, format pattern) of the reference values.
-5. Never leave a value unnormalised — every input must map to a meaningful output.
+CRITICAL RULES — follow these strictly:
+1. ALWAYS output one of the ALLOWED TARGET VALUES above when possible. Copy the target value EXACTLY (same casing, spacing, punctuation). This is the most important rule.
+2. Resolve abbreviations, codes, aliases, typos, and foreign-language labels to the correct target value:
+   - "US"/"USA"/"United States of America" → whichever target value represents the US
+   - "Jammy"/"jammy"/"Ubuntu 22.04" → the matching Ubuntu target value
+   - "RHEL 9"/"RH9"/"RedHat 9.x" → the matching Red Hat target value
+   - "WS2022"/"WinSrv2022"/"Win 2022 Server" → the matching Windows Server target value
+   - "spa"/"SPA"/"Spanisch"/"spanish"/"es_ES" → the matching Spanish language target value
+   - "日本語"/"ja_JP"/"japanese"/"jpn" → the matching Japanese target value
+   - "yes"/"true"/"1"/"on"/"active"/"enabled"/"y" → the target's active/true value
+   - "no"/"false"/"0"/"off"/"inactive"/"disabled"/"n" → the target's inactive/false value
+   - "P"/"I"/"A" single-letter codes → infer meaning from column context
+   - "prod"/"production"/"live"/"p" → the target's production value
+   - "dev"/"development"/"d" → the target's dev value
+   - "uat"/"staging"/"qa"/"quality assurance"/"test"/"testing" → appropriate target value
+   - "sev1"/"critical"/"p1"/"1" → target's highest severity
+   - "sev3"/"minor"/"p4"/"low"/"4" → target's lowest severity
+3. If a value CANNOT map to any existing target value, produce a value that matches the STYLE and FORMAT PATTERN of the target values (same casing convention, same naming pattern, same level of detail).
+4. Every input MUST produce a meaningful output — never return the input unchanged unless it already matches a target value exactly.
 
-Return ALL input values.`;
+Return ALL ${batch.length} input values.`;
 }
 
 async function llmBatchNormalise(
@@ -202,7 +208,7 @@ async function llmBatchNormalise(
             LLM_CALL_TIMEOUT_MS
           );
           const result = await generateObject({
-            model: anthropic("claude-haiku-4-5"),
+            model: anthropic("claude-sonnet-4-5"),
             schema: LlmNormalisationSchema,
             prompt,
             abortSignal: controller.signal
@@ -213,7 +219,12 @@ async function llmBatchNormalise(
             map.set(item.input, item.output);
           }
           return map;
-        } catch {
+        } catch (err) {
+          // Log so failures are visible, then pass through unchanged
+          console.error(
+            `[normalise] LLM batch failed for "${columnName}" (${batch.length} values):`,
+            err instanceof Error ? err.message : err
+          );
           const map = new Map<string, string>();
           for (const value of batch) {
             map.set(value, value);
