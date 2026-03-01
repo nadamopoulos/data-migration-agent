@@ -175,6 +175,10 @@ const structuralTransform = (
   }
 };
 
+// ── Route config ────────────────────────────────────────────────────
+
+export const maxDuration = 120;
+
 // ── Route handler ────────────────────────────────────────────────────
 
 export async function POST(request: Request) {

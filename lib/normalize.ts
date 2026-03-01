@@ -58,13 +58,36 @@ type ResolvedValue = {
 // ── Constants ────────────────────────────────────────────────────────
 
 const FUZZY_THRESHOLD = 0.7;
-const LLM_BATCH_SIZE = 80;
+const LLM_BATCH_SIZE = 120;
+const LLM_CONCURRENCY = 6;
 const STRUCTURAL_TYPES = new Set([
   "date_format",
   "phone_format",
   "number_format",
   "name_split"
 ]);
+
+// ── Concurrency limiter ──────────────────────────────────────────────
+
+type Limiter = <T>(fn: () => Promise<T>) => Promise<T>;
+
+function createLimiter(concurrency: number): Limiter {
+  let active = 0;
+  const queue: (() => void)[] = [];
+
+  return async function <T>(fn: () => Promise<T>): Promise<T> {
+    if (active >= concurrency) {
+      await new Promise<void>((resolve) => queue.push(resolve));
+    }
+    active++;
+    try {
+      return await fn();
+    } finally {
+      active--;
+      queue.shift()?.();
+    }
+  };
+}
 
 // ── Stage 1: Exact match (case-insensitive) ──────────────────────────
 
@@ -111,21 +134,13 @@ const LlmNormalisationSchema = z.object({
   )
 });
 
-async function llmBatchNormalise(
-  unmatchedValues: string[],
+function buildLlmPrompt(
+  batch: string[],
   targetValues: string[],
   columnName: string,
-  normalisationRule: string,
-  apiKey: string
-): Promise<Map<string, string>> {
-  if (unmatchedValues.length === 0) return new Map();
-
-  const allResults = new Map<string, string>();
-
-  for (let i = 0; i < unmatchedValues.length; i += LLM_BATCH_SIZE) {
-    const batch = unmatchedValues.slice(i, i + LLM_BATCH_SIZE);
-
-    const prompt = `You are a data normalisation expert migrating messy source data into a clean target schema.
+  normalisationRule: string
+): string {
+  return `You are a data normalisation expert migrating messy source data into a clean target schema.
 
 TARGET COLUMN: "${columnName}"
 RULE / CONTEXT: ${normalisationRule || "Normalise each value to match the target vocabulary and format."}
@@ -150,27 +165,194 @@ NORMALISATION GUIDELINES:
 5. Never leave a value unnormalised — every input must map to a meaningful output.
 
 Return ALL input values.`;
+}
 
-    try {
-      const anthropic = createAnthropic({ apiKey });
-      const result = await generateObject({
-        model: anthropic("claude-sonnet-4-5"),
-        schema: LlmNormalisationSchema,
-        prompt
-      });
+async function llmBatchNormalise(
+  unmatchedValues: string[],
+  targetValues: string[],
+  columnName: string,
+  normalisationRule: string,
+  apiKey: string,
+  limiter: Limiter
+): Promise<Map<string, string>> {
+  if (unmatchedValues.length === 0) return new Map();
 
-      for (const item of result.object.normalizedValues) {
-        allResults.set(item.input, item.output);
+  // Split into batches
+  const batches: string[][] = [];
+  for (let i = 0; i < unmatchedValues.length; i += LLM_BATCH_SIZE) {
+    batches.push(unmatchedValues.slice(i, i + LLM_BATCH_SIZE));
+  }
+
+  // Fire all batches in parallel (concurrency-limited)
+  const batchResults = await Promise.all(
+    batches.map((batch) =>
+      limiter(async () => {
+        const prompt = buildLlmPrompt(
+          batch,
+          targetValues,
+          columnName,
+          normalisationRule
+        );
+        try {
+          const anthropic = createAnthropic({ apiKey });
+          const result = await generateObject({
+            model: anthropic("claude-sonnet-4-5"),
+            schema: LlmNormalisationSchema,
+            prompt
+          });
+          const map = new Map<string, string>();
+          for (const item of result.object.normalizedValues) {
+            map.set(item.input, item.output);
+          }
+          return map;
+        } catch {
+          const map = new Map<string, string>();
+          for (const value of batch) {
+            map.set(value, value);
+          }
+          return map;
+        }
+      })
+    )
+  );
+
+  // Merge all batch results
+  const allResults = new Map<string, string>();
+  for (const batchMap of batchResults) {
+    for (const [k, v] of batchMap) {
+      allResults.set(k, v);
+    }
+  }
+  return allResults;
+}
+
+// ── Per-column processing (stages 1–3) ───────────────────────────────
+
+type ColumnResult = {
+  targetColumn: string;
+  values: string[];
+  stats: ColumnStats;
+};
+
+async function processColumn(
+  mapping: MappingInput,
+  inputRows: Record<string, string>[],
+  targetValues: string[],
+  targetLookup: Map<string, string>,
+  apiKey: string | null,
+  structuralTransform: (value: string, mapping: MappingInput) => string,
+  limiter: Limiter
+): Promise<ColumnResult> {
+  const stats: ColumnStats = {
+    column: mapping.targetColumn,
+    exact: 0,
+    fuzzy: 0,
+    llm: 0,
+    structural: 0,
+    passthrough: 0,
+    total: inputRows.length
+  };
+
+  const isStructural = STRUCTURAL_TYPES.has(mapping.transformType);
+  const useValueMatching = !isStructural && targetValues.length > 0;
+
+  // ── Structural-only path (dates, phones, numbers, name splits) ──
+  if (!useValueMatching) {
+    const values = inputRows.map((row) => {
+      const raw = row[mapping.inputColumn] ?? "";
+      stats.structural++;
+      return structuralTransform(String(raw), mapping);
+    });
+    return { targetColumn: mapping.targetColumn, values, stats };
+  }
+
+  // ── 3-stage value normalisation ──
+  const resolved: (ResolvedValue | null)[] = new Array(
+    inputRows.length
+  ).fill(null);
+
+  // Stage 1: Exact match (raw value, then structurally-transformed)
+  for (let i = 0; i < inputRows.length; i++) {
+    const raw = String(inputRows[i][mapping.inputColumn] ?? "").trim();
+
+    if (raw === "") {
+      resolved[i] = { output: "", stage: "passthrough" };
+      stats.passthrough++;
+      continue;
+    }
+
+    const directMatch = exactMatch(raw, targetLookup);
+    if (directMatch !== null) {
+      resolved[i] = { output: directMatch, stage: "exact" };
+      stats.exact++;
+      continue;
+    }
+
+    // Try after structural transform (handles casing, trimming, etc.)
+    const transformed = structuralTransform(raw, mapping);
+    const transformedMatch = exactMatch(transformed, targetLookup);
+    if (transformedMatch !== null) {
+      resolved[i] = { output: transformedMatch, stage: "exact" };
+      stats.exact++;
+    }
+  }
+
+  // Stage 2: Fuzzy match for unresolved
+  for (let i = 0; i < inputRows.length; i++) {
+    if (resolved[i] !== null) continue;
+
+    const raw = String(inputRows[i][mapping.inputColumn] ?? "").trim();
+    const match = fuzzyMatch(raw, targetValues);
+    if (match !== null) {
+      resolved[i] = { output: match, stage: "fuzzy" };
+      stats.fuzzy++;
+    }
+  }
+
+  // Stage 3: LLM reasoning for remaining unresolved
+  // Group by unique value so each distinct input is normalised once
+  const unresolvedMap = new Map<string, number[]>();
+  for (let i = 0; i < inputRows.length; i++) {
+    if (resolved[i] !== null) continue;
+    const raw = String(inputRows[i][mapping.inputColumn] ?? "").trim();
+    const existing = unresolvedMap.get(raw);
+    if (existing) {
+      existing.push(i);
+    } else {
+      unresolvedMap.set(raw, [i]);
+    }
+  }
+
+  if (unresolvedMap.size > 0 && apiKey) {
+    const llmMapping = await llmBatchNormalise(
+      Array.from(unresolvedMap.keys()),
+      targetValues,
+      mapping.targetColumn,
+      mapping.normalisationRule,
+      apiKey,
+      limiter
+    );
+
+    for (const [inputVal, indices] of unresolvedMap) {
+      const normalised = llmMapping.get(inputVal) ?? inputVal;
+      for (const idx of indices) {
+        resolved[idx] = { output: normalised, stage: "llm" };
+        stats.llm++;
       }
-    } catch {
-      // LLM failed for this batch — keep values as-is
-      for (const value of batch) {
-        allResults.set(value, value);
+    }
+  } else if (unresolvedMap.size > 0) {
+    // No API key — fall back to structural transform
+    for (const [inputVal, indices] of unresolvedMap) {
+      const transformed = structuralTransform(inputVal, mapping);
+      for (const idx of indices) {
+        resolved[idx] = { output: transformed, stage: "structural" };
+        stats.structural++;
       }
     }
   }
 
-  return allResults;
+  const values = resolved.map((r) => r?.output ?? "");
+  return { targetColumn: mapping.targetColumn, values, stats };
 }
 
 // ── Main pipeline ────────────────────────────────────────────────────
@@ -198,143 +380,60 @@ export async function normalisePipeline(
 }> {
   const { mappings, inputRows, targetRows, apiKey, structuralTransform } =
     options;
-  const outputRows: Record<string, string>[] = inputRows.map(() => ({}));
-  const allStats: ColumnStats[] = [];
 
+  // Shared concurrency limiter for all LLM calls across all columns
+  const limiter = createLimiter(LLM_CONCURRENCY);
+
+  // Pre-compute target values and lookups per column
+  const targetData = new Map<
+    string,
+    { values: string[]; lookup: Map<string, string> }
+  >();
   for (const mapping of mappings) {
-    const stats: ColumnStats = {
-      column: mapping.targetColumn,
-      exact: 0,
-      fuzzy: 0,
-      llm: 0,
-      structural: 0,
-      passthrough: 0,
-      total: inputRows.length
-    };
-
-    // Collect unique target values for this column
-    const targetValuesSet = new Set<string>();
+    if (targetData.has(mapping.targetColumn)) continue;
+    const valuesSet = new Set<string>();
     for (const row of targetRows) {
       const val = row[mapping.targetColumn];
       if (val != null && String(val).trim() !== "") {
-        targetValuesSet.add(String(val).trim());
+        valuesSet.add(String(val).trim());
       }
     }
-    const targetValues = Array.from(targetValuesSet);
-
-    // Case-insensitive lookup
-    const targetLookup = new Map<string, string>();
-    for (const val of targetValues) {
-      targetLookup.set(val.toLowerCase(), val);
+    const values = Array.from(valuesSet);
+    const lookup = new Map<string, string>();
+    for (const val of values) {
+      lookup.set(val.toLowerCase(), val);
     }
+    targetData.set(mapping.targetColumn, { values, lookup });
+  }
 
-    const isStructural = STRUCTURAL_TYPES.has(mapping.transformType);
-    const useValueMatching = !isStructural && targetValues.length > 0;
-
-    // ── Structural-only path (dates, phones, numbers, name splits) ──
-    if (!useValueMatching) {
-      for (let i = 0; i < inputRows.length; i++) {
-        const raw = inputRows[i][mapping.inputColumn] ?? "";
-        outputRows[i][mapping.targetColumn] = structuralTransform(
-          String(raw),
-          mapping
-        );
-        stats.structural++;
-      }
-      allStats.push(stats);
-      continue;
-    }
-
-    // ── 3-stage value normalisation ──
-    const resolved: (ResolvedValue | null)[] = new Array(
-      inputRows.length
-    ).fill(null);
-
-    // Stage 1: Exact match (raw value, then structurally-transformed)
-    for (let i = 0; i < inputRows.length; i++) {
-      const raw = String(inputRows[i][mapping.inputColumn] ?? "").trim();
-
-      if (raw === "") {
-        resolved[i] = { output: "", stage: "passthrough" };
-        stats.passthrough++;
-        continue;
-      }
-
-      const directMatch = exactMatch(raw, targetLookup);
-      if (directMatch !== null) {
-        resolved[i] = { output: directMatch, stage: "exact" };
-        stats.exact++;
-        continue;
-      }
-
-      // Try after structural transform (handles casing, trimming, etc.)
-      const transformed = structuralTransform(raw, mapping);
-      const transformedMatch = exactMatch(transformed, targetLookup);
-      if (transformedMatch !== null) {
-        resolved[i] = { output: transformedMatch, stage: "exact" };
-        stats.exact++;
-      }
-    }
-
-    // Stage 2: Fuzzy match for unresolved
-    for (let i = 0; i < inputRows.length; i++) {
-      if (resolved[i] !== null) continue;
-
-      const raw = String(inputRows[i][mapping.inputColumn] ?? "").trim();
-      const match = fuzzyMatch(raw, targetValues);
-      if (match !== null) {
-        resolved[i] = { output: match, stage: "fuzzy" };
-        stats.fuzzy++;
-      }
-    }
-
-    // Stage 3: LLM reasoning for remaining unresolved
-    // Group by unique value so each distinct input is normalised once
-    const unresolvedMap = new Map<string, number[]>();
-    for (let i = 0; i < inputRows.length; i++) {
-      if (resolved[i] !== null) continue;
-      const raw = String(inputRows[i][mapping.inputColumn] ?? "").trim();
-      const existing = unresolvedMap.get(raw);
-      if (existing) {
-        existing.push(i);
-      } else {
-        unresolvedMap.set(raw, [i]);
-      }
-    }
-
-    if (unresolvedMap.size > 0 && apiKey) {
-      const llmMapping = await llmBatchNormalise(
-        Array.from(unresolvedMap.keys()),
-        targetValues,
-        mapping.targetColumn,
-        mapping.normalisationRule,
-        apiKey
+  // Process ALL columns in parallel
+  const columnResults = await Promise.all(
+    mappings.map((mapping) => {
+      const { values, lookup } = targetData.get(mapping.targetColumn) ?? {
+        values: [],
+        lookup: new Map()
+      };
+      return processColumn(
+        mapping,
+        inputRows,
+        values,
+        lookup,
+        apiKey,
+        structuralTransform,
+        limiter
       );
+    })
+  );
 
-      for (const [inputVal, indices] of unresolvedMap) {
-        const normalised = llmMapping.get(inputVal) ?? inputVal;
-        for (const idx of indices) {
-          resolved[idx] = { output: normalised, stage: "llm" };
-          stats.llm++;
-        }
-      }
-    } else if (unresolvedMap.size > 0) {
-      // No API key — fall back to structural transform
-      for (const [inputVal, indices] of unresolvedMap) {
-        const transformed = structuralTransform(inputVal, mapping);
-        for (const idx of indices) {
-          resolved[idx] = { output: transformed, stage: "structural" };
-          stats.structural++;
-        }
-      }
-    }
+  // Merge column results into output rows
+  const outputRows: Record<string, string>[] = inputRows.map(() => ({}));
+  const allStats: ColumnStats[] = [];
 
-    // Write to output rows
+  for (const result of columnResults) {
     for (let i = 0; i < inputRows.length; i++) {
-      outputRows[i][mapping.targetColumn] = resolved[i]?.output ?? "";
+      outputRows[i][result.targetColumn] = result.values[i];
     }
-
-    allStats.push(stats);
+    allStats.push(result.stats);
   }
 
   return { rows: outputRows, stats: allStats };
