@@ -182,7 +182,7 @@ async function inferColumnRules(
         LLM_CALL_TIMEOUT_MS
       );
       const result = await generateObject({
-        model: anthropic("claude-sonnet-4-5"),
+        model: anthropic("claude-sonnet-4-6"),
         schema: ColumnRulesSchema,
         prompt: buildRuleInferencePrompt(columns),
         abortSignal: controller.signal
@@ -284,7 +284,7 @@ async function llmBatchNormalise(
             LLM_CALL_TIMEOUT_MS
           );
           const result = await generateObject({
-            model: anthropic("claude-sonnet-4-5"),
+            model: anthropic("claude-sonnet-4-6"),
             schema: LlmNormalisationSchema,
             prompt,
             abortSignal: controller.signal
