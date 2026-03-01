@@ -4,8 +4,10 @@ import Papa, { ParseResult } from "papaparse";
 
 import { ResponseSchema } from "@/lib/schemas";
 
+export const maxDuration = 120;
+
 const MAX_SAMPLE_ROWS = 10;
-const MAX_GENERATION_ATTEMPTS = 2;
+const MAX_GENERATION_ATTEMPTS = 3;
 
 type ParsedCsv = {
   headers: string[];
@@ -155,6 +157,7 @@ export async function POST(request: Request) {
     const prompt = buildPrompt({ inputCsv: parsedInput, targetCsv: parsedTarget });
     const anthropic = createAnthropic({ apiKey });
 
+    let lastError = "";
     for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt += 1) {
       try {
         const result = await generateObject({
@@ -169,21 +172,23 @@ export async function POST(request: Request) {
         }
 
         return Response.json(validated.data);
-      } catch {
-        // Retry once when the model output is invalid or generation fails.
+      } catch (err) {
+        lastError =
+          err instanceof Error ? err.message : "Unknown generation error";
       }
     }
 
     return Response.json(
       {
-        error:
-          "Unable to generate a valid mapping plan. Please try again with clearer sample CSV files."
+        error: `Unable to generate a valid mapping plan after ${MAX_GENERATION_ATTEMPTS} attempts: ${lastError}`
       },
       { status: 502 }
     );
-  } catch {
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Unknown error";
     return Response.json(
-      { error: "The mapping agent could not process your request." },
+      { error: `The mapping agent could not process your request: ${message}` },
       { status: 500 }
     );
   }
