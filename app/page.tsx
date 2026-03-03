@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, DragEvent, useEffect, useRef, useState } from "react";
-import { AlertCircle, Eye, EyeOff, FileText, Key, Loader2, Upload, X } from "lucide-react";
+import { AlertCircle, AlertTriangle, CheckCircle2, Eye, EyeOff, FileText, Key, Loader2, ShieldAlert, Upload, X } from "lucide-react";
 import Papa, { ParseResult } from "papaparse";
 import { z } from "zod";
 
@@ -18,8 +18,8 @@ import {
   TableRow
 } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
-import type { AgentResponse, Mapping } from "@/lib/schemas";
-import { ResponseSchema } from "@/lib/schemas";
+import type { AgentResponse, Mapping, NshotValidationResult as NshotValidationResultType } from "@/lib/schemas";
+import { ResponseSchema, NshotValidationResultSchema } from "@/lib/schemas";
 
 type CsvSummary = {
   file: File;
@@ -58,7 +58,8 @@ const ApplyResponseSchema = z.object({
     rowCount: z.number(),
     columnCount: z.number()
   }),
-  normalisationStats: z.array(ColumnStatsSchema).optional()
+  normalisationStats: z.array(ColumnStatsSchema).optional(),
+  validation: NshotValidationResultSchema.optional()
 });
 
 const isCsvFile = (file: File) =>
@@ -133,6 +134,7 @@ export default function Home() {
   const [outputSummary, setOutputSummary] = useState<OutputSummary | null>(null);
   const [outputPreview, setOutputPreview] = useState<Record<string, string>[]>([]);
   const [normalisationStats, setNormalisationStats] = useState<ColumnStats[]>([]);
+  const [validationResult, setValidationResult] = useState<NshotValidationResultType | null>(null);
   const [stage, setStage] = useState<Stage>("upload");
   const [isLoading, setIsLoading] = useState(false);
   const [loadingAction, setLoadingAction] = useState<"agent" | "apply" | null>(null);
@@ -175,6 +177,7 @@ export default function Home() {
     setOutputSummary(null);
     setOutputPreview([]);
     setNormalisationStats([]);
+    setValidationResult(null);
     setStage("upload");
   };
 
@@ -420,6 +423,7 @@ export default function Home() {
       setOutputSummary(validated.data.summary);
       setOutputPreview(previewRows);
       setNormalisationStats(validated.data.normalisationStats ?? []);
+      setValidationResult(validated.data.validation ?? null);
       setStage("result");
     } catch (applyError) {
       setError(
@@ -759,6 +763,127 @@ export default function Home() {
               <p className="text-sm text-slate-700">
                 {outputSummary.rowCount} rows • {outputSummary.columnCount} columns
               </p>
+
+              {validationResult && (
+                <div className="space-y-3">
+                  {validationResult.passed ? (
+                    <Alert>
+                      <CheckCircle2 className="h-4 w-4 text-green-600" />
+                      <AlertTitle className="text-green-800">
+                        N-Shot Validation Passed
+                      </AlertTitle>
+                      <AlertDescription className="text-green-700">
+                        {validationResult.sampleSize} sample rows checked — no
+                        cross-column contamination or hallucinations detected.
+                      </AlertDescription>
+                    </Alert>
+                  ) : (
+                    <Alert variant="destructive">
+                      <ShieldAlert className="h-4 w-4" />
+                      <AlertTitle>
+                        N-Shot Validation Found Issues
+                      </AlertTitle>
+                      <AlertDescription>
+                        {validationResult.violations.length} issue
+                        {validationResult.violations.length !== 1 ? "s" : ""}{" "}
+                        detected across {validationResult.sampleSize} sample
+                        rows. Review the details below before downloading.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+
+                  {/* Per-column confidence */}
+                  {validationResult.columnConfidence.length > 0 && (
+                    <div className="rounded-md border">
+                      <Table>
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead>Column</TableHead>
+                            <TableHead className="text-center">
+                              Confidence
+                            </TableHead>
+                            <TableHead className="text-center">
+                              Violations
+                            </TableHead>
+                            <TableHead className="text-center">
+                              Checked Rows
+                            </TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {validationResult.columnConfidence.map((col) => (
+                            <TableRow key={`conf-${col.column}`}>
+                              <TableCell className="font-medium">
+                                {col.column}
+                              </TableCell>
+                              <TableCell className="text-center">
+                                <span
+                                  className={cn(
+                                    "inline-block rounded-full px-2 py-0.5 text-xs font-medium",
+                                    col.confidence >= 0.8
+                                      ? "bg-green-100 text-green-800"
+                                      : col.confidence >= 0.5
+                                        ? "bg-amber-100 text-amber-800"
+                                        : "bg-red-100 text-red-800"
+                                  )}
+                                >
+                                  {(col.confidence * 100).toFixed(0)}%
+                                </span>
+                              </TableCell>
+                              <TableCell className="text-center">
+                                {col.violations > 0 ? (
+                                  <span className="inline-block rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-800">
+                                    {col.violations}
+                                  </span>
+                                ) : (
+                                  <span className="text-xs text-slate-400">
+                                    0
+                                  </span>
+                                )}
+                              </TableCell>
+                              <TableCell className="text-center text-xs text-slate-500">
+                                {col.checkedRows}
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  )}
+
+                  {/* Violation details */}
+                  {validationResult.violations.length > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-sm font-medium text-slate-800">
+                        Violation Details
+                      </p>
+                      <div className="max-h-64 space-y-2 overflow-y-auto">
+                        {validationResult.violations.map((v, idx) => (
+                          <div
+                            key={`viol-${idx}`}
+                            className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm"
+                          >
+                            <div className="flex items-center gap-2">
+                              <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0 text-red-600" />
+                              <span className="font-medium text-red-800">
+                                {v.type === "cross_column_contamination"
+                                  ? "Cross-Column Contamination"
+                                  : "Hallucination"}
+                              </span>
+                              <span className="text-xs text-red-600">
+                                Row {v.row + 1} &middot; {v.targetColumn}
+                              </span>
+                            </div>
+                            <p className="mt-1 text-xs text-red-700">
+                              {v.detail}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {normalisationStats.length > 0 && (
                 <div className="space-y-2">

@@ -27,3 +27,33 @@ export const ResponseSchema = z.object({
 
 export type Mapping = z.infer<typeof MappingSchema>;
 export type AgentResponse = z.infer<typeof ResponseSchema>;
+
+// ── N-shot validation schemas ────────────────────────────────────────
+
+export const ValidationViolationSchema = z.object({
+  row: z.number(),
+  targetColumn: z.string(),
+  inputColumn: z.string(),
+  inputValue: z.string(),
+  outputValue: z.string(),
+  type: z.enum(["cross_column_contamination", "hallucination"]),
+  detail: z.string()
+});
+
+export const ColumnConfidenceSchema = z.object({
+  column: z.string(),
+  confidence: z.number(),
+  violations: z.number(),
+  checkedRows: z.number()
+});
+
+export const NshotValidationResultSchema = z.object({
+  sampleSize: z.number(),
+  passed: z.boolean(),
+  violations: z.array(ValidationViolationSchema),
+  columnConfidence: z.array(ColumnConfidenceSchema)
+});
+
+export type ValidationViolation = z.infer<typeof ValidationViolationSchema>;
+export type ColumnConfidence = z.infer<typeof ColumnConfidenceSchema>;
+export type NshotValidationResult = z.infer<typeof NshotValidationResultSchema>;

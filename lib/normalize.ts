@@ -25,7 +25,7 @@ function levenshtein(a: string, b: string): number {
   return prev[n];
 }
 
-function stringSimilarity(a: string, b: string): number {
+export function stringSimilarity(a: string, b: string): number {
   const maxLen = Math.max(a.length, b.length);
   if (maxLen === 0) return 1;
   return 1 - levenshtein(a.toLowerCase(), b.toLowerCase()) / maxLen;

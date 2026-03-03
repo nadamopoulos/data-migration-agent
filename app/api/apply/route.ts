@@ -6,6 +6,11 @@ import {
   normalisePipeline,
   type MappingInput
 } from "@/lib/normalize";
+import {
+  nShotValidate,
+  selectSampleRows,
+  DEFAULT_N_SHOT_SIZE
+} from "@/lib/validate";
 
 // ── Request schema ───────────────────────────────────────────────────
 
@@ -221,6 +226,37 @@ export async function POST(request: Request) {
       structuralTransform
     });
 
+    // ── N-shot validation ──────────────────────────────────────────
+    // Sample n rows from the output and validate for cross-column
+    // contamination and hallucinations.
+
+    const nShotSize = DEFAULT_N_SHOT_SIZE;
+    const { indices: sampleIndices } = selectSampleRows(
+      inputRows,
+      nShotSize
+    );
+    const sampleInput = sampleIndices.map((i) => inputRows[i]);
+    const sampleOutput = sampleIndices.map((i) => transformedRows[i]);
+
+    // Build target vocabulary for validation
+    const targetVocabulary = new Map<string, Set<string>>();
+    for (const mapping of mappings) {
+      if (targetVocabulary.has(mapping.targetColumn)) continue;
+      const vals = new Set<string>();
+      for (const row of targetRows) {
+        const v = (row[mapping.targetColumn] ?? "").trim();
+        if (v) vals.add(v);
+      }
+      targetVocabulary.set(mapping.targetColumn, vals);
+    }
+
+    const validation = nShotValidate(
+      sampleInput,
+      sampleOutput,
+      mappings,
+      targetVocabulary
+    );
+
     const csv = Papa.unparse({
       fields: targetColumns,
       data: transformedRows
@@ -232,7 +268,8 @@ export async function POST(request: Request) {
         rowCount: transformedRows.length,
         columnCount: targetColumns.length
       },
-      normalisationStats: stats
+      normalisationStats: stats,
+      validation
     });
   } catch (err) {
     const message =
